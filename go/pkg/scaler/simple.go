@@ -17,14 +17,15 @@ import (
 	"container/list"
 	"context"
 	"fmt"
+	"log"
+	"sync"
+	"time"
+
 	"github.com/AliyunContainerService/scaler/go/pkg/config"
 	model2 "github.com/AliyunContainerService/scaler/go/pkg/model"
 	platform_client2 "github.com/AliyunContainerService/scaler/go/pkg/platform_client"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"log"
-	"sync"
-	"time"
 
 	pb "github.com/AliyunContainerService/scaler/proto"
 	"github.com/google/uuid"
@@ -110,6 +111,7 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 			Key:           request.MetaData.Key,
 			Runtime:       request.MetaData.Runtime,
 			TimeoutInSecs: request.MetaData.TimeoutInSecs,
+			MemoryInMb:    request.MetaData.MemoryInMb,
 		},
 	}
 	instance, err := s.platformClient.Init(ctx, request.RequestId, instanceId, slot, meta)
@@ -168,6 +170,7 @@ func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleRep
 		slotId = instance.Slot.Id
 		instance.LastIdleTime = time.Now()
 		if needDestroy {
+			delete(s.instances, instance.Id)
 			log.Printf("request id %s, instance %s need be destroy", request.Assigment.RequestId, instanceId)
 			return reply, nil
 		}
