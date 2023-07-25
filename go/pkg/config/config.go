@@ -16,13 +16,17 @@ package config
 import "time"
 
 type Config struct {
-	ClientAddr           string
-	GcInterval           time.Duration
-	IdleDurationBeforeGC time.Duration
+	ClientAddr             string
+	GcInterval             time.Duration
+	IdleDurationBeforeGC   time.Duration
+	TaskPerInstance        int
+	MaxInstanceExisPerTask int
 }
 
 var DefaultConfig = Config{
-	ClientAddr:           "127.0.0.1:50051",
-	GcInterval:           10 * time.Second,
-	IdleDurationBeforeGC: 5 * time.Minute,
+	ClientAddr:             "127.0.0.1:50051",
+	GcInterval:             10 * time.Second,
+	IdleDurationBeforeGC:   5 * time.Minute,
+	TaskPerInstance:        2,
+	MaxInstanceExisPerTask: 1,
 }
