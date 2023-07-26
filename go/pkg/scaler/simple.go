@@ -36,10 +36,11 @@ type Simple struct {
 	metaData       *model2.Meta
 	platformClient platform_client2.Client
 	mu             sync.Mutex
+	cond           *sync.Cond
 	wg             sync.WaitGroup
 	instances      map[string]*model2.Instance
-	waitingQueue   *list.List
 	idleInstance   *list.List
+	waitingCnt     int
 }
 
 /*
@@ -60,9 +61,10 @@ func New(metaData *model2.Meta, config *config.Config) Scaler {
 		mu:             sync.Mutex{},
 		wg:             sync.WaitGroup{},
 		instances:      make(map[string]*model2.Instance),
-		waitingQueue:   list.New(),
 		idleInstance:   list.New(),
+		waitingCnt:     0,
 	}
+	scheduler.cond = sync.NewCond(&scheduler.mu)
 	log.Printf("New scaler for app: %s is created", metaData.Key)
 	scheduler.wg.Add(1)
 	go func() {
@@ -74,8 +76,9 @@ func New(metaData *model2.Meta, config *config.Config) Scaler {
 	return scheduler
 }
 
-func (s *Simple) NeedCreate(ctx context.Context, requestId string) {
+func (s *Simple) NeedCreate(ctx context.Context, cancel context.CancelFunc, requestId string) {
 	//Create new Instance
+	defer s.cond.Signal()
 	resourceConfig := model2.SlotResourceConfig{
 		ResourceConfig: pb.ResourceConfig{
 			MemoryInMegabytes: s.metaData.MemoryInMb,
@@ -85,6 +88,7 @@ func (s *Simple) NeedCreate(ctx context.Context, requestId string) {
 	if err != nil {
 		errorMessage := fmt.Sprintf("create slot failed with: %s", err.Error())
 		log.Println(errorMessage)
+		cancel()
 		return
 	}
 
@@ -101,37 +105,16 @@ func (s *Simple) NeedCreate(ctx context.Context, requestId string) {
 	if err != nil {
 		errorMessage := fmt.Sprintf("create instance failed with: %s", err.Error())
 		log.Println(errorMessage)
+		cancel()
 		return
 	}
 	//add new instance
 	s.mu.Lock()
-	if element := s.waitingQueue.Front(); element != nil {
-		s.instances[instance.Id] = instance
-		retCh := element.Value.(*chan string)
-		s.waitingQueue.Remove(element)
-		instance.Busy = true
-		s.mu.Unlock()
-		*retCh <- instance.Id
-		close(*retCh)
-	} else {
-		curTaskCnt := len(s.instances) - s.idleInstance.Len() + s.waitingQueue.Len()
-		curInstanceCnt := len(s.instances)
-		if curInstanceCnt > s.config.MaxInstanceExisPerTask*curTaskCnt {
-			s.mu.Unlock()
-			reason := fmt.Sprintln("idle instance")
-			ctx := context.Background()
-			ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			s.deleteSlot(ctx, uuid.NewString(), instance.Slot.Id, instance.Id, instance.Meta.Key, reason)
-		} else {
-			s.instances[instance.Id] = instance
-			s.idleInstance.PushFront(instance)
-			instance.Busy = false
-			s.mu.Unlock()
-		}
-
-	}
-
+	s.instances[instance.Id] = instance
+	instance.LastIdleTime = time.Now()
+	s.idleInstance.PushFront(instance)
+	instance.Busy = false
+	s.mu.Unlock()
 }
 
 func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.AssignReply, error) {
@@ -142,48 +125,39 @@ func (s *Simple) Assign(ctx context.Context, request *pb.AssignRequest) (*pb.Ass
 	}()
 	log.Printf("Assign, request id: %s", request.RequestId)
 	s.mu.Lock()
-	if element := s.idleInstance.Front(); element != nil {
-		instance := element.Value.(*model2.Instance)
-		instance.Busy = true
-		s.idleInstance.Remove(element)
-		curInstanceCnt := len(s.instances)
-		curTaskCnt := len(s.instances) - s.idleInstance.Len() + s.waitingQueue.Len()
-		s.mu.Unlock()
-		log.Printf("Assign, request id: %s, instance %s reused", request.RequestId, instance.Id)
-		if curTaskCnt > curInstanceCnt*s.config.TaskPerInstance {
-			go s.NeedCreate(ctx, request.RequestId)
+	s.waitingCnt += 1
+	for {
+		if element := s.idleInstance.Front(); element != nil {
+			instance := element.Value.(*model2.Instance)
+			instance.Busy = true
+			s.idleInstance.Remove(element)
+			s.waitingCnt -= 1
+			s.mu.Unlock()
+			log.Printf("Assign, request id: %s, instance %s reused", request.RequestId, instance.Id)
+
+			return &pb.AssignReply{
+				Status: pb.Status_Ok,
+				Assigment: &pb.Assignment{
+					RequestId:  request.RequestId,
+					MetaKey:    instance.Meta.Key,
+					InstanceId: instance.Id,
+				},
+				ErrorMessage: nil,
+			}, nil
 		}
-		return &pb.AssignReply{
-			Status: pb.Status_Ok,
-			Assigment: &pb.Assignment{
-				RequestId:  request.RequestId,
-				MetaKey:    instance.Meta.Key,
-				InstanceId: instance.Id,
-			},
-			ErrorMessage: nil,
-		}, nil
-	}
-	retCh := make(chan string, 1)
-	s.waitingQueue.PushBack(&retCh)
-	curInstanceCnt := len(s.instances)
-	curTaskCnt := len(s.instances) - s.idleInstance.Len() + s.waitingQueue.Len()
-	s.mu.Unlock()
-	if curTaskCnt > curInstanceCnt*s.config.TaskPerInstance {
-		go s.NeedCreate(ctx, request.RequestId)
-	}
-	select {
-	case instanceId = <-retCh:
-		return &pb.AssignReply{
-			Status: pb.Status_Ok,
-			Assigment: &pb.Assignment{
-				RequestId:  request.RequestId,
-				MetaKey:    request.MetaData.Key,
-				InstanceId: instanceId,
-			},
-			ErrorMessage: nil,
-		}, nil
-	case <-time.After(10 * time.Second):
-		return nil, status.Error(codes.Internal, fmt.Sprintln("timeout, may be create instance fail"))
+		curInstanceCnt := len(s.instances)
+		curTaskCnt := len(s.instances) - s.idleInstance.Len() + s.waitingCnt
+		newCtx, cancel := context.WithCancel(context.Background())
+		if curTaskCnt > curInstanceCnt*s.config.TaskPerInstance {
+			go s.NeedCreate(ctx, cancel, request.RequestId)
+		}
+		s.cond.Wait()
+		select {
+		case <-newCtx.Done():
+			s.mu.Unlock()
+			return nil, status.Error(codes.Internal, fmt.Sprintf("fail to crate slot or fail to init instance, requestId: %s", request.RequestId))
+		default:
+		}
 	}
 }
 
@@ -206,28 +180,21 @@ func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleRep
 	if request.Result != nil && request.Result.NeedDestroy != nil && *request.Result.NeedDestroy {
 		needDestroy = true
 	}
-	curTaskCnt := 0
-	curInstanceCnt := 0
+
 	defer func() {
 		if needDestroy {
-			if curTaskCnt > curInstanceCnt*s.config.TaskPerInstance {
-				go s.NeedCreate(ctx, uuid.NewString())
-			}
 			s.deleteSlot(ctx, request.Assigment.RequestId, slotId, instanceId, request.Assigment.MetaKey, "bad instance")
 		}
 	}()
 	log.Printf("Idle, request id: %s", request.Assigment.RequestId)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	curInstanceCnt = len(s.instances)
-	curTaskCnt = len(s.instances) - s.idleInstance.Len() + s.waitingQueue.Len()
+
 	if instance := s.instances[instanceId]; instance != nil {
 		slotId = instance.Slot.Id
 		instance.LastIdleTime = time.Now()
 		if needDestroy {
 			delete(s.instances, instance.Id)
-			curInstanceCnt -= 1
-			curTaskCnt -= 1
 			log.Printf("request id %s, instance %s need be destroy", request.Assigment.RequestId, instanceId)
 			return reply, nil
 		}
@@ -237,17 +204,8 @@ func (s *Simple) Idle(ctx context.Context, request *pb.IdleRequest) (*pb.IdleRep
 			return reply, nil
 		}
 		instance.Busy = false
-		curTaskCnt -= 1
-
-		if element := s.waitingQueue.Front(); element != nil {
-			retCh := element.Value.(*chan string)
-			s.waitingQueue.Remove(element)
-			instance.Busy = true
-			*retCh <- instance.Id
-			close(*retCh)
-		} else {
-			s.idleInstance.PushFront(instance)
-		}
+		s.idleInstance.PushFront(instance)
+		s.cond.Signal()
 	} else {
 		return nil, status.Errorf(codes.NotFound, fmt.Sprintf("request id %s, instance %s not found", request.Assigment.RequestId, instanceId))
 	}
@@ -272,7 +230,7 @@ func (s *Simple) gcLoop() {
 			s.mu.Lock()
 			if element := s.idleInstance.Back(); element != nil {
 				instance := element.Value.(*model2.Instance)
-				idleDuration := time.Now().Sub(instance.LastIdleTime)
+				idleDuration := time.Since(instance.LastIdleTime)
 				if idleDuration > s.config.IdleDurationBeforeGC {
 					//need GC
 					s.idleInstance.Remove(element)
